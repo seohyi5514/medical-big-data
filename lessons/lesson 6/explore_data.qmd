@@ -1,0 +1,723 @@
+---
+title: "Exploratory Data Analysis for Electronic Health Record Data"
+subtitle: "Descriptive"
+author: "Ben Gerber, MD, MPH"
+date: last-modified
+format:
+  revealjs:
+    theme: dracula
+    slide-number: true
+    chalkboard: true
+    preview-links: auto
+    transition: slide
+    code-line-numbers: true
+    code-fold: true
+    scrollable: true
+    footer: "EDA for EHR Data"
+    smaller: true
+    css: |
+      .reveal h2 { border-bottom: 2px solid #2C6E91; padding-bottom: 0.2em; }
+      .reveal .slide-number { color: #7a7a7a; }
+      .reveal pre code { max-height: 480px; }
+      .reveal section.smaller { font-size: 0.72em; }
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+## Learning Objectives
+
+By the end of today, you will be able to:
+
+- Explain why exploratory data analysis (EDA) is a critical 1st step before modeling EHR data
+- Use **skimr** and other packages to profile a clinical dataset quickly
+- Build publication-quality descriptive tables ("Table 1") with **gtsummary**
+- Check univariate and multivariate distributions using appropriate diagnostics
+- Create histograms, density plots, and comparison visuals with **ggplot2**
+- Identify missingness, outliers, and data-quality issues unique to EHR data
+- Recognize censoring in time-to-event EHR data and perform survival-specific EDA
+
+---
+
+## Why EDA Matters for EHR Data
+
+EHR data is:
+
+- **Observational, not experimental** — collected for clinical/billing purposes, not research
+- **Messy** — missingness is informative (missing-not-at-random), duplicate encounters, unit inconsistencies
+- **High-dimensional and mixed-type** — labs (continuous), diagnoses (categorical/coded), notes (text), time series (vitals)
+- **Time-to-event in nature** — death, readmission, and disease onset are censored by follow-up windows, not fully observed
+
+> Before you model anything, you must understand what you're modeling. EDA is where data errors are caught *before* they become "findings"
+
+---
+
+## A Typical EDA Workflow
+
+```{mermaid}
+%%| fig-width: 9
+flowchart LR
+  A[Raw EHR extract] --> B[Structure check</br>dim, types, keys]
+  B --> C[Missingness &<br>quality audit]
+  C --> D[Univariate<br>distributions]
+  D --> E[Descriptive tables<br>Table 1]
+  E --> F[Bivariate / group<br>comparisons]
+  F --> G[Time-to-event &<br>censoring checks]
+  G --> H[Flag anomalies,<br>plan modeling]
+```
+
+---
+
+## Setting Up: Packages for Today
+
+```{r}
+#| label: setup
+#| eval: false
+
+install.packages(c(
+  "tidyverse",    # data wrangling + ggplot2
+  "skimr",        # quick data summaries
+  "gtsummary",    # publication-ready summary tables
+  "gt",           # table rendering engine used by gtsummary
+  "naniar",       # missing data visualization
+  "visdat",       # visual data structure/type overview
+  "dlookr",       # diagnose, describe, and visualize data
+  "inspectdf",    # column-wise inspection & comparison
+  "correlationfunnel", # correlation vs. binary outcome
+  "ggstatsplot",  # stats-annotated ggplot visuals
+  "patchwork",    # combine multiple ggplots
+  "easystats",    # report, performance, see
+  "survival",     # core survival analysis
+  "survminer",    # Kaplan-Meier & diagnostic plots
+  "ggsurvfit",    # modern tidy survival plotting
+  "condsurv"      # conditional survival & censoring helpers
+))
+```
+
+```{r}
+#| label: library-load
+library(tidyverse)
+library(skimr)
+library(gtsummary)
+library(naniar)
+library(visdat)
+library(dlookr)
+library(patchwork)
+library(survival)
+library(survminer)
+theme_set(theme_minimal(base_size = 14))
+```
+
+---
+
+## Simulating a Realistic (Synthetic) EHR Cohort
+
+We simulate an inpatient/longitudinal cohort — no real patient data is used.
+
+```{r}
+#| label: simulate-data
+set.seed(42)
+n <- 1200
+
+ehr <- tibble(
+  patient_id   = sprintf("PT%05d", 1:n),
+  age          = round(rnorm(n, mean = 62, sd = 16)),
+  sex          = sample(c("Female", "Male"), n, replace = TRUE, prob = c(0.52, 0.48)),
+  race_eth     = sample(c("White", "Black", "Hispanic", "Asian", "Other"),
+                         n, replace = TRUE, prob = c(0.55, 0.18, 0.15, 0.08, 0.04)),
+  bmi          = pmax(14, rnorm(n, mean = 29, sd = 6)),
+  sbp          = round(110 + 0.35 * (age - 62) + rnorm(n, mean = 0, sd = 15)),
+  ldl          = round(rnorm(n, mean = 110, sd = 35)),
+  diabetes     = rbinom(n, 1, plogis(-2 + 0.04 * (age - 60))),
+  a1c          = round(ifelse(
+    diabetes == 1,
+    rgamma(n, shape = 6, scale = 1.3) + 5.5,   
+    rnorm(n, mean = 5.4, sd = 0.3)              
+  ), 1),
+  hypertension = rbinom(n, 1, plogis(-1.5 + 0.05 * (age - 60))),
+  los_days     = round(rgamma(n, shape = 1.6, scale = 2.4), 1),
+  readmit_30d  = rbinom(n, 1, 0.12),
+  admit_source = sample(c("ED", "Direct", "Transfer"), n, replace = TRUE,
+                         prob = c(0.65, 0.25, 0.10))
+)
+
+# Inject realistic messiness: missingness + a few implausible values
+ehr <- ehr |>
+  mutate(
+    bmi  = ifelse(runif(n) < 0.08, NA, bmi),
+    ldl  = ifelse(runif(n) < 0.15, NA, ldl),
+    a1c  = ifelse(runif(n) < 0.30, NA, a1c),  # not everyone gets an A1c
+    sbp  = ifelse(row_number() %in% sample(1:n, 3), 999, sbp) # sentinel/error codes
+  )
+
+glimpse(ehr)
+```
+
+---
+
+## Step 1: Structural Overview with `skimr`
+
+```{r}
+#| label: skim-overview
+skim(ehr)
+```
+
+---
+
+## Zooming In with `skimr`
+
+```{r}
+#| label: skim-subset
+ehr |>
+  select(age, bmi, sbp, ldl, a1c, los_days) |>
+  skim() |>
+  yank("numeric")
+```
+
+- Inline sparkline histograms flag skew (`los_days`) and impossible values (`sbp` max = 999) immediately
+- `skim()` output is a tidy data frame — usable directly in later chunks
+
+---
+
+## Step 2: Auditing Missingness — `naniar`
+
+```{r}
+#| label: naniar-vis-miss
+#| fig-width: 9
+#| fig-height: 5
+naniar::vis_miss(ehr, sort_miss = TRUE)
+```
+
+---
+
+## Missingness Patterns and Co-occurrence
+
+```{r}
+#| label: naniar-upset
+#| fig-width: 9
+#| fig-height: 5
+naniar::gg_miss_upset(ehr)
+```
+
+> `a1c` missingness is clinically meaningful: patients without diabetes
+> risk factors (cholesterol) are less likely to have an A1c ordered
+
+---
+
+## Structure & Type Overview — `visdat`
+
+```{r}
+#| label: visdat
+#| fig-width: 9
+#| fig-height: 5
+visdat::vis_dat(ehr)
+```
+
+---
+
+## Cleaning Obvious Sentinel Errors
+
+```{r}
+#| label: clean-sentinels
+ehr <- ehr |>
+  mutate(
+    sbp = na_if(sbp, 999),          # 999 was a data-entry sentinel
+    age = ifelse(age < 0 | age > 105, NA, age)
+  )
+
+naniar::miss_var_summary(ehr) |>
+  filter(n_miss > 0)
+```
+
+Always ask: *is this missing value random, a workflow artifact, or a coding error?*
+
+Note: rewriting `ehr` for exercise, but in practice don't change your raw data!
+
+---
+
+## Step 3: Automated Diagnostics — `dlookr`
+
+```{r}
+#| label: dlookr-diagnose
+dlookr::diagnose(ehr) |>
+  arrange(desc(missing_percent))
+```
+
+```{r}
+#| label: dlookr-numeric
+dlookr::diagnose_numeric(ehr) |>
+  select(variables, min, mean, median, max, outlier)
+```
+
+---
+
+## Step 4: Descriptive Table 1 with `gtsummary` 
+
+```{r}
+#| label: gtsummary-table1
+ehr |>
+  select(age, sex, race_eth, bmi, sbp, ldl, a1c,
+         diabetes, hypertension, los_days, admit_source) |>
+  tbl_summary(
+    statistic = list(all_continuous() ~ "{mean} ({sd})",
+                     all_categorical() ~ "{n} ({p}%)"),
+    missing = "ifany",
+    missing_text = "Missing"
+  ) |>
+  bold_labels()
+```
+
+---
+
+## Comparing Groups: Readmitted vs. Not
+
+```{r}
+#| label: gtsummary-compare
+ehr |>
+  mutate(readmit_30d = factor(readmit_30d, labels = c("No", "Yes"))) |>
+  select(age, sex, bmi, sbp, ldl, a1c, diabetes,
+         hypertension, los_days, readmit_30d) |>
+  tbl_summary(
+    by = readmit_30d,
+    statistic = list(all_continuous() ~ "{median} ({p25}, {p75})"),
+    missing = "ifany"
+  ) |>
+  add_p(test = list(all_continuous() ~ "wilcox.test",
+                    all_categorical() ~ "chisq.test")) |>
+  add_overall() |>
+  bold_labels() |>
+  bold_p(t = 0.05)
+```
+
+What are problems/limitations with statistics presented here?
+
+---
+
+## Step 5: Checking Distributions — Histograms
+
+```{r}
+#| label: hist-basic
+#| fig-width: 9
+#| fig-height: 5
+ggplot(ehr, aes(x = los_days)) +
+  geom_histogram(bins = 40, fill = "#2C6E91", color = "white") +
+  labs(title = "Length of Stay Distribution",
+       x = "Length of stay (days)", y = "Count")
+```
+
+Right-skewed — typical of LOS, cost, and count-type clinical variables.
+
+---
+
+## Multiple Distributions at Once
+
+```{r}
+#| label: hist-facets
+#| fig-width: 10
+#| fig-height: 5.5
+ehr |>
+  select(age, bmi, sbp, ldl, a1c, los_days) |>
+  pivot_longer(everything(), names_to = "variable", values_to = "value") |>
+  filter(!is.na(value)) |>
+  ggplot(aes(x = value)) +
+  geom_histogram(bins = 30, fill = "#2C6E91", color = "white") +
+  facet_wrap(~ variable, scales = "free", ncol = 3) +
+  labs(title = "Univariate Distributions of Key Clinical Variables",
+       x = NULL, y = "Count")
+```
+
+---
+
+## Density + Histogram Overlay
+
+```{r}
+#| label: density-overlay
+#| fig-width: 9
+#| fig-height: 5
+ggplot(ehr, aes(x = bmi)) +
+  geom_histogram(aes(y = after_stat(density)), bins = 35,
+                  fill = "#A8D5BA", color = "white") +
+  geom_density(color = "#1B4332", linewidth = 1) +
+  labs(title = "BMI Distribution with Density Curve",
+       x = "BMI", y = "Density")
+```
+
+---
+
+## Visual Group Comparisons — Boxplots 
+
+```{r}
+#| label: boxplot-compare
+#| fig-width: 9
+#| fig-height: 5
+ehr |>
+  mutate(readmit_30d = factor(readmit_30d, labels = c("No", "Yes"))) |>
+  ggplot(aes(x = readmit_30d, y = los_days, fill = readmit_30d)) +
+  geom_boxplot(alpha = 0.8, outlier.alpha = 0.4) +
+  scale_fill_manual(values = c("#4C9F70", "#C1440E")) +
+  labs(title = "Length of Stay by 30-Day Readmission Status",
+       x = "Readmitted within 30 days?", y = "Length of stay (days)",
+       fill = NULL)
+```
+
+---
+
+## Combining Panels with `patchwork`
+
+```{r}
+#| label: patchwork-combo
+#| fig-width: 10
+#| fig-height: 5.5
+p1 <- ggplot(ehr, aes(age)) +
+  geom_histogram(bins = 30, fill = "#2C6E91", color = "white") +
+  labs(title = "Age")
+
+p2 <- ggplot(ehr, aes(x = sex, y = bmi, fill = sex)) +
+  geom_violin(alpha = 0.7) +
+  geom_boxplot(width = 0.1, fill = "white") +
+  labs(title = "BMI by Sex", x = NULL) +
+  theme(legend.position = "none")
+
+p1 + p2
+```
+
+---
+
+## Stats-Annotated Visuals — `ggstatsplot`
+
+Helpful when adding stats to `ggplot2` objects.
+
+```{r}
+#| label: ggstatsplot-demo
+#| fig-width: 9
+#| fig-height: 5.5
+library(ggstatsplot)
+ehr |>
+  mutate(diabetes = factor(diabetes, labels = c("No", "Yes"))) |>
+  ggbetweenstats(
+    x = diabetes, y = a1c,
+    title = "A1c by Diabetes Status",
+    type = "nonparametric",
+    xlab = "Diabetes diagnosis", ylab = "Hemoglobin A1c (%)"
+  )
+```
+
+What if A1c high in people with "no" diabetes diagnosis?
+
+---
+
+## Correlation Structure — Numeric Variables
+
+```{r}
+#| label: corr-heatmap
+#| fig-width: 8
+#| fig-height: 5.5
+ehr |>
+  select(age, bmi, sbp, ldl, a1c, los_days) |>
+  cor(use = "pairwise.complete.obs") |>
+  as.data.frame() |>
+  rownames_to_column("var1") |>
+  pivot_longer(-var1, names_to = "var2", values_to = "r") |>
+  ggplot(aes(var1, var2, fill = r)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = round(r, 2)), size = 3.5) +
+  scale_fill_gradient2(low = "#C1440E", mid = "white", high = "#2C6E91",
+                        midpoint = 0, limits = c(-1, 1)) +
+  labs(title = "Pairwise Correlations", x = NULL, y = NULL, fill = "r") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+---
+
+# Survival & Censoring EDA {background-color="#1B4332"}
+
+## Why Time-to-Event Data Needs Its Own EDA 
+
+Many EHR outcomes are **time-to-event**, not one-off measurements:
+
+- Time to death, readmission, disease progression, device failure
+- Follow-up ends before the event happens for many patients → **censoring**
+- Standard histograms/means on "time" alone are **misleading** if you ignore censoring
+
+**Types of censoring in EHR data:**
+
+- **Right censoring** — follow-up ends (study end, loss to follow-up, transfer of care) before the event occurs
+- **Left censoring** — event already happened before observation began (e.g., undiagnosed disease onset)
+- **Interval censoring** — event known only to have occurred between two visits
+- **Competing risks** — a different event (e.g., death from another cause) precludes the event of interest
+
+---
+
+## Simulating Time-to-Event Data with Censoring 
+
+```{r}
+#| label: simulate-survival
+set.seed(42)
+
+surv_df <- ehr |>
+  mutate(
+    true_event_time = rexp(n, rate = 0.002 * exp(0.015 * (age - 60) + 0.4 * diabetes)),
+    admin_censor_time = 730,
+    loss_fu_time = runif(n, min = 30, max = 730),
+    time = pmin(true_event_time, admin_censor_time, loss_fu_time),
+    status = case_when(
+      true_event_time <= pmin(admin_censor_time, loss_fu_time) ~ 1L, # event observed
+      TRUE ~ 0L                                                       # censored
+    )
+  ) |>
+  select(patient_id, age, sex, diabetes, hypertension, time, status)
+
+glimpse(surv_df)
+```
+
+---
+
+## First Look: Censoring Rate & Follow-Up Time 
+
+```{r}
+#| label: censoring-summary
+surv_df |>
+  summarise(
+    n              = n(),
+    n_events       = sum(status == 1),
+    n_censored     = sum(status == 0),
+    pct_censored   = mean(status == 0) * 100,
+    median_fu_days = median(time),
+    max_fu_days    = max(time)
+  )
+```
+
+```{r}
+#| label: censoring-by-group
+surv_df |>
+  group_by(diabetes) |>
+  summarise(
+    n = n(),
+    pct_censored = mean(status == 0) * 100,
+    median_fu = median(time)
+  )
+```
+
+> Always report the censoring proportion *before* fitting any survival model —
+> a >50% censoring rate changes how much you should trust tail estimates.
+
+---
+
+## Visualizing Follow-Up Time and Event Status 
+
+```{r}
+#| label: followup-plot
+#| fig-width: 9
+#| fig-height: 5.5
+surv_df |>
+  slice_sample(n = 60) |>
+  arrange(time) |>
+  mutate(id = row_number(),
+         status_lab = factor(status, labels = c("Censored", "Event"))) |>
+  ggplot(aes(x = time, y = id, color = status_lab)) +
+  geom_segment(aes(x = 0, xend = time, y = id, yend = id), alpha = 0.5) +
+  geom_point(size = 2) +
+  scale_color_manual(values = c("Censored" = "#7a7a7a", "Event" = "#C1440E")) +
+  labs(title = "Follow-Up Time per Patient (random sample of 60)",
+       x = "Days since baseline", y = "Patient (sorted by follow-up time)",
+       color = NULL) +
+  theme(axis.text.y = element_blank(), axis.ticks.y = element_blank())
+```
+
+This "lollipop" or swimmer-style plot is a core EDA visual for time-to-event data —
+it makes censoring visible at the individual level, not just as a summary statistic.
+
+---
+
+## Histogram of Observed Time, Stratified by Status
+
+```{r}
+#| label: time-hist-status
+#| fig-width: 9
+#| fig-height: 5
+surv_df |>
+  mutate(status_lab = factor(status, labels = c("Censored", "Event"))) |>
+  ggplot(aes(x = time, fill = status_lab)) +
+  geom_histogram(bins = 40, alpha = 0.8, position = "identity") +
+  scale_fill_manual(values = c("Censored" = "#7a7a7a", "Event" = "#C1440E")) +
+  labs(title = "Distribution of Observed Follow-Up Time",
+       x = "Time (days)", y = "Count", fill = NULL)
+```
+
+---
+
+## The Kaplan-Meier Estimator as an EDA Tool 
+
+```{r}
+#| label: km-overall
+#| fig-width: 9
+#| fig-height: 5.5
+km_fit <- survfit(Surv(time, status) ~ 1, data = surv_df)
+
+ggsurvplot(
+  km_fit,
+  data = surv_df,
+  conf.int = TRUE,
+  risk.table = TRUE,
+  xlab = "Days since baseline",
+  ylab = "Event-free probability",
+  title = "Overall Kaplan-Meier Curve",
+  ggtheme = theme_minimal(base_size = 12)
+)
+```
+
+The **risk table** below the curve is itself an EDA device: it shows how many
+patients remain under observation at each time point — a shrinking risk set
+means later parts of the curve are estimated from very few patients.
+
+---
+
+## Comparing Survival Across Groups 
+
+```{r}
+#| label: km-by-diabetes
+#| fig-width: 9
+#| fig-height: 5.5
+km_group <- survfit(Surv(time, status) ~ diabetes, data = surv_df)
+
+ggsurvplot(
+  km_group,
+  data = surv_df,
+  conf.int = TRUE,
+  risk.table = TRUE,
+  pval = TRUE,
+  legend.labs = c("No Diabetes", "Diabetes"),
+  xlab = "Days since baseline",
+  ylab = "Event-free probability",
+  title = "Kaplan-Meier by Diabetes Status",
+  ggtheme = theme_minimal(base_size = 12)
+)
+```
+
+The log-rank p-value here is descriptive/exploratory — it flags a group
+difference worth investigating further, not a final causal conclusion.
+
+---
+
+## Checking the Proportional-Hazards Assumption Visually 
+
+```{r}
+#| label: cloglog-plot
+#| fig-width: 9
+#| fig-height: 5.5
+ggsurvplot(
+  km_group,
+  data = surv_df,
+  fun = "cloglog",
+  legend.labs = c("No Diabetes", "Diabetes"),
+  xlab = "Days since baseline (log scale)",
+  ylab = "log(-log(Survival))",
+  title = "Complementary Log-Log Plot",
+  ggtheme = theme_minimal(base_size = 12)
+)
+```
+
+Roughly parallel curves on the cloglog scale support the proportional-hazards
+assumption — a quick visual EDA check *before* committing to a Cox model.
+
+---
+
+## Cumulative Incidence / Hazard-Style View
+
+```{r}
+#| label: cumhaz-plot
+#| fig-width: 9
+#| fig-height: 5.5
+ggsurvplot(
+  km_group,
+  data = surv_df,
+  fun = "cumhaz",
+  conf.int = TRUE,
+  legend.labs = c("No Diabetes", "Diabetes"),
+  xlab = "Days since baseline",
+  ylab = "Cumulative hazard",
+  title = "Cumulative Hazard by Diabetes Status",
+  ggtheme = theme_minimal(base_size = 12)
+)
+```
+
+---
+
+## Table 1 for Survival Cohorts — `gtsummary`
+
+```{r}
+#| label: gtsummary-survival
+surv_df |>
+  select(age, sex, diabetes, hypertension, time, status) |>
+  mutate(status = factor(status, labels = c("Censored", "Event"))) |>
+  tbl_summary(
+    by = status,
+    statistic = list(all_continuous() ~ "{median} ({p25}, {p75})")
+  ) |>
+  add_overall() |>
+  bold_labels()
+```
+
+`gtsummary` also has `tbl_survfit()`, which reports survival probabilities
+(e.g., 1-year, 2-year event-free rates) directly as a formatted table:
+
+```{r}
+#| label: tbl-survfit
+tbl_survfit(
+  km_group,
+  times = c(180, 365, 730),
+  label_header = "**{time} days**"
+)
+```
+
+---
+
+## Survival EDA Checklist 
+
+1. **Quantify censoring** — overall % censored, and by key subgroups
+2. **Distinguish censoring types** — administrative end-of-study vs. loss-to-follow-up vs. competing risk
+3. **Visualize individual follow-up** — swimmer/lollipop plots to catch anomalies (e.g., negative or zero time)
+4. **Plot Kaplan-Meier curves** with risk tables — don't trust the tail where the risk set is thin
+5. **Check assumptions visually** — cloglog plots before assuming proportional hazards
+6. **Compare groups descriptively** before any formal Cox modeling
+7. **Watch for immortal time bias** — make sure time-zero is defined consistently across patients
+
+---
+
+## Putting It Together: A Full EDA Checklist for EHR Data 
+
+1. **Structure** — dimensions, types, unique identifiers, duplicate rows/visits (`skimr`, `visdat`)
+2. **Missingness** — patterns, mechanism (MCAR/MAR/MNAR), clinical plausibility (`naniar`)
+3. **Data quality** — sentinel values, impossible ranges, unit mismatches (`dlookr`)
+4. **Univariate** — shape, skew, outliers per variable (`ggplot2`, `skimr`)
+5. **Descriptive tables** — stratified summaries with tests where appropriate (`gtsummary`)
+6. **Bivariate/multivariate** — correlations, group comparisons (`ggstatsplot`)
+7. **Time-to-event structure** — censoring rate, follow-up distribution, KM curves (`survival`, `survminer`)
+8. **Document everything** — EDA decisions must be reproducible and justified
+
+---
+
+## Common EHR-Specific Pitfalls 
+
+- **Informative missingness**: a missing lab often means "not clinically indicated," not "random"
+- **Multiple encounters per patient**: don't treat visit-level rows as independent without checking
+- **Left/right censoring**: patients enter/leave the system; "no diagnosis recorded" ≠ "no disease"
+- **Immortal time bias**: exposure defined after time-zero can artificially inflate survival
+- **Competing risks ignored**: treating death as censoring when it precludes the outcome of interest
+- **Coding changes over time**: ICD-9 → ICD-10 transitions, billing code updates
+- **Selection bias**: EHR cohorts reflect who sought/received care, not the general population
+
+---
+
+## Summary
+
+- EDA is not a formality — for EHR data it is where most **real** data problems are found
+- `skimr`, `visdat`, `naniar`, `dlookr` → fast structural and quality audits
+- `gtsummary` → publication-ready descriptive, comparison, and survival tables
+- `ggplot2` (+ `patchwork`, `ggstatsplot`) → distributions and visual group comparisons
+- `survival` + `survminer` → Kaplan-Meier curves, risk tables, censoring diagnostics
+- Always interpret findings **clinically**, not just statistically
+
+
+
