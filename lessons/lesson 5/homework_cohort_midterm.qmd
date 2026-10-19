@@ -1,0 +1,133 @@
+---
+title: "Midterm: Working with Cohorts"
+subtitle: "Healthcare Big Data Analytics in R"
+author: "이름"
+date: last-modified
+format:
+  html:
+    toc: true
+    toc-depth: 2
+    number-sections: true
+    code-fold: false
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+# Working with Cohorts
+
+## Intersection Variables
+
+Studies using the OMOP CDM often start with creating patient cohorts. Typically we begin by identifying a target (exposure) cohort. 
+
+We can then create various other cohorts, for example, to characterize the comorbidities of people at time of entry into the target cohort or to summarize the health outcome after entering the target cohort. 
+
+These intersections between our target cohort and other cohorts (or even other tables in the OMOP CDM) can take many forms and will typically require temporal (time-based) logic. 
+
+The [`PatientProfiles`](https://darwin-eu.github.io/PatientProfiles/) R package provides flexible functions to calculate of intersections between cohorts, concept sets, or other OMOP CDM tables. Additional packages needed are included in setup.
+
+## The Clinical Problem
+
+Suppose we are interested in studying patients with gastrointestinal (GI) bleeding and describing their use of different medicines. 
+
+We will first create one cohort for patients with GI bleeding (our target cohort). 
+
+Next we can create another cohort for patients with exposure to various medications that can increase this risk of bleeding (e.g., [NSAIDs](https://my.clevelandclinic.org/health/treatments/11086-non-steroidal-anti-inflammatory-medicines-nsaids)). 
+
+When creating these medication cohorts we will only create them for individuals in our GI bleeding cohort.
+
+## Setup
+
+```{r}
+#| label: setup
+
+library(omock)
+library(CodelistGenerator)
+library(PatientProfiles)
+library(CohortCharacteristics)
+library(CohortConstructor)
+
+cdm <- mockCdmFromDataset(
+  datasetName = "GiBleed",
+  source = "duckdb"
+)
+```
+
+## Define the Codes for our Cohorts
+
+Create a concept set using `newCodeList()` and the appropriate `concept_id` for GI bleed. (Hint: instead of bleeding, consider other synonyms, like "hemorrhage"...).
+
+Then, use `getDrugIngredientCodes()` with at least 3 different NSAIDs for a second concept set. 
+
+**Do the medications in the set contain ingredients or actual pill medication?**
+
+```{r}
+#| label: define-cohorts
+
+# Add code here...
+```
+
+## Create Cohorts
+
+Now we create two cohorts using `conceptCohort()`.
+
+*Cohort 1*: Make a "GI Bleed" cohort using your concept set. Use `requireIsFirstEntry()` to keep only the first entry for each person.
+
+*Cohort 2*: Make an "NSAID" cohort using your other concept set. Use only people who are in the "GI Bleed" cohort (why might this be helpful?). Also, use `collapseCohorts` to merge entries if they are within the same week.
+
+```{r}
+#| label: create-cohorts
+
+# Add code here...
+```
+
+
+## Flag Intersection
+
+Now create flag indicators and add to your "GI Bleed" cohort whether each person had medication before or after the GI Bleed (3 different time windows), using `addCohortIntersectFlag`.
+
+**Do the results show any intersections between NSAIDs and GI Bleeding? Before or after?**
+
+```{r}
+#| label: flag-intersection
+
+# Add code here...
+```
+
+## Count Intersections
+
+Now use `addCohortIntersectCount` and count up the interactions.
+
+```{r}
+#| label: count-intersections
+
+# Add code here...
+```
+
+## Summary Table
+
+Try making a summary table with `summariseCharacteristics()` and `tableCharacteristics()`.
+
+Do not worry about making associations or interpretations from these results. More importantly, think about what you might look for when analyzing data. 
+
+**How might these results be useful in examining relationships between NSAIDs and GI Bleed? What limitations or challenges exist in interpretation of these observational data?**
+
+```{r}
+#| label: summary-table
+
+# Add code here...
+```
+
+## Close Up
+
+```{r}
+#| label: close-up
+
+cdmDisconnect(cdm)
+```
+
+
+
+
+
